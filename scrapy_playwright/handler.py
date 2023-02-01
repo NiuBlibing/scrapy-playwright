@@ -132,6 +132,7 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
             if not hasattr(self, "browser"):
                 logger.info("Launching browser %s", self.browser_type.name)
                 self.browser: Browser = await self.browser_type.launch(**self.launch_options)
+                self.browser.on("disconnected", self.__make_close_browser_callback())
                 logger.info("Browser %s launched", self.browser_type.name)
 
     async def _create_browser_context(
@@ -448,6 +449,12 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
             )
 
         return close_browser_context_callback
+
+    def __make_close_browser_callback(self) -> Callable:
+        def close_browser_call() -> None:
+            logger.debug("Browser closed")
+            del self.browser
+        return close_browser_call
 
     def _make_request_handler(
         self,
