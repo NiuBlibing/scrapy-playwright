@@ -32,6 +32,7 @@ from w3lib.encoding import html_body_declared_encoding, http_content_type_encodi
 from scrapy_playwright.headers import use_scrapy_headers
 from scrapy_playwright.page import PageMethod
 
+import uuid
 
 __all__ = ["ScrapyPlaywrightDownloadHandler"]
 
@@ -156,9 +157,10 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
             self.stats.inc_value("playwright/context_count/non_persistent")
         context.on("close", self._make_close_browser_context_callback(name, persistent, spider))
         logger.debug(
-            "Browser context started: '%s' (persistent=%s)",
+            "Browser context started: '%s' (persistent=%s), context count is %i",
             name,
             persistent,
+            len(self.browser.contexts),
             extra={"spider": spider, "context_name": name, "persistent": persistent},
         )
         self.stats.inc_value("playwright/context_count")
@@ -174,14 +176,19 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
 
     async def _create_page(self, request: Request, spider: Spider) -> Page:
         """Create a new page in a context, also creating a new context if necessary."""
-        context_name = request.meta.setdefault("playwright_context", DEFAULT_CONTEXT_NAME)
+        if request.meta.setdefault("playwright_close_context", False):
+            context_name = request.meta.setdefault("playwright_context", uuid.uuid4())
+        else:
+            context_name = request.meta.setdefault("playwright_context", DEFAULT_CONTEXT_NAME)
+        context_kwargs = request.meta.get(
+            "playwright_context_kwargs") or self.context_kwargs.get(DEFAULT_CONTEXT_NAME) or {}
         # this block needs to be locked because several attempts to launch a context
         # with the same name could happen at the same time from different requests
         async with self.context_launch_lock:
             ctx_wrapper = self.context_wrappers.get(context_name)
             if ctx_wrapper is None:
                 ctx_wrapper = await self._create_browser_context(
-                    name=context_name, context_kwargs=request.meta.get("playwright_context_kwargs")
+                    name=context_name, context_kwargs=context_kwargs
                 )
 
         await ctx_wrapper.semaphore.acquire()
@@ -297,9 +304,9 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
         try:
             result = await self._download_request_with_page(request, page, spider)
         except Exception as ex:
-            if not request.meta.get("playwright_include_page") and not page.is_closed():
+            if request.meta.get("playwright_close_context"):
                 logger.warning(
-                    "Closing page due to failed request: %s exc_type=%s exc_msg=%s",
+                    "Closing context due to failed request: %s exc_type=%s exc_msg=%s",
                     request,
                     type(ex),
                     str(ex),
@@ -311,8 +318,27 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
                         "exception": ex,
                     },
                 )
+                ctx_wrapper = self.context_wrappers.get(context_name)
                 await page.close()
+                await ctx_wrapper.context.close()
                 self.stats.inc_value("playwright/page_count/closed")
+            else:
+                if not request.meta.get("playwright_include_page") and not page.is_closed():
+                    logger.warning(
+                        "Closing page due to failed request: %s exc_type=%s exc_msg=%s",
+                        request,
+                        type(ex),
+                        str(ex),
+                        extra={
+                            "spider": spider,
+                            "context_name": context_name,
+                            "scrapy_request_url": request.url,
+                            "scrapy_request_method": request.method,
+                            "exception": ex,
+                        },
+                    )
+                    await page.close()
+                    self.stats.inc_value("playwright/page_count/closed")
             raise
         else:
             return result
@@ -365,6 +391,9 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
 
         body, encoding = _encode_body(headers=headers, text=body_str)
         respcls = responsetypes.from_args(headers=headers, url=page.url, body=body)
+        if request.meta.get("playwright_close_context"):
+            ctx_wrapper = self.context_wrappers.get(context_name)
+            await ctx_wrapper.context.close()
         return respcls(
             url=page.url,
             status=response.status if response is not None else 200,
